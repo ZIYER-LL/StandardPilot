@@ -1,115 +1,82 @@
-const DEFAULT_BACKENDS = {
-  python: {
-    id: 'python',
-    label: 'Python',
-    baseUrl: import.meta.env.VITE_PYTHON_API_URL || '/api/python',
-    port: '8000'
-  },
-  java: {
-    id: 'java',
-    label: 'Java',
-    baseUrl: import.meta.env.VITE_JAVA_API_URL || '/api/java',
-    port: '8080'
-  }
-}
+const DEFAULT_ENDPOINT = import.meta.env.VITE_API_URL || import.meta.env.VITE_PYTHON_API_URL || '/api/python'
 
 export function createInitialSettings() {
   const saved = readSettings()
   return {
-    backend: saved.backend || 'java',
-    userId: saved.userId || 'u1001',
-    conversationId: saved.conversationId || '',
-    endpoints: {
-      python: saved.endpoints?.python || DEFAULT_BACKENDS.python.baseUrl,
-      java: saved.endpoints?.java || DEFAULT_BACKENDS.java.baseUrl
-    }
+    endpoint: saved.endpoint || saved.endpoints?.python || DEFAULT_ENDPOINT,
+    userId: saved.userId || 'researcher-001',
+    conversationId: saved.conversationId || ''
   }
 }
 
 export function saveSettings(settings) {
-  localStorage.setItem('echomind.frontend.settings', JSON.stringify(settings))
+  localStorage.setItem('standardpilot.frontend.settings', JSON.stringify(settings))
 }
 
-export function backendMeta(type, settings) {
-  const meta = DEFAULT_BACKENDS[type] || DEFAULT_BACKENDS.java
+export function backendMeta(settings) {
   return {
-    ...meta,
-    baseUrl: normalizeBaseUrl(settings.endpoints[type] || meta.baseUrl)
+    id: 'standardpilot',
+    label: 'StandardPilot Python',
+    baseUrl: normalizeBaseUrl(settings.endpoint || DEFAULT_ENDPOINT)
   }
 }
 
-export async function requestHealth(type, settings) {
-  return requestJson(backendMeta(type, settings).baseUrl, '/health')
+export async function requestHealth(settings) {
+  return requestJson(backendMeta(settings).baseUrl, '/health')
 }
 
-export async function requestMonitor(type, settings) {
-  return requestJson(backendMeta(type, settings).baseUrl, '/monitor')
+export async function requestMonitor(settings) {
+  return requestJson(backendMeta(settings).baseUrl, '/monitor')
 }
 
-export async function requestKnowledgeStats(type, settings) {
-  return requestJson(backendMeta(type, settings).baseUrl, '/knowledge/stats')
+export async function requestKnowledgeStats(settings) {
+  return requestJson(backendMeta(settings).baseUrl, '/knowledge/stats')
 }
 
-export async function requestSearch(type, settings, query, topK = 5) {
-  const params = new URLSearchParams({ query, topK: String(topK) })
-  return requestJson(backendMeta(type, settings).baseUrl, `/search?${params}`, { method: 'POST' })
+export async function requestSearch(settings, query, topK = 5) {
+  const params = new URLSearchParams({ query, top_k: String(topK) })
+  return requestJson(backendMeta(settings).baseUrl, `/search?${params}`, { method: 'POST' })
 }
 
-export async function requestChat(type, settings, message) {
-  const meta = backendMeta(type, settings)
-  const payload = buildChatPayload(type, settings, message)
-  const raw = await requestJson(meta.baseUrl, '/chat', {
+export async function requestChat(settings, message) {
+  const raw = await requestJson(backendMeta(settings).baseUrl, '/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
+    body: JSON.stringify({
+      message,
+      user_id: settings.userId || 'anonymous',
+      conv_id: settings.conversationId || undefined
+    })
   })
-  return normalizeChatResponse(type, raw)
+  return normalizeChatResponse(raw)
 }
 
-export async function addKnowledge(type, settings, documents) {
-  return requestJson(backendMeta(type, settings).baseUrl, '/knowledge/add', {
+export async function addKnowledge(settings, documents) {
+  return requestJson(backendMeta(settings).baseUrl, '/knowledge/add', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ documents })
   })
 }
 
-export async function uploadKnowledge(type, settings, file) {
+export async function uploadKnowledge(settings, file) {
   const form = new FormData()
   form.append('file', file)
-  return requestJson(backendMeta(type, settings).baseUrl, '/knowledge/upload', {
+  return requestJson(backendMeta(settings).baseUrl, '/knowledge/upload', {
     method: 'POST',
     body: form
   })
 }
 
-function buildChatPayload(type, settings, message) {
-  if (type === 'python') {
-    return {
-      message,
-      user_id: settings.userId || 'anonymous',
-      conv_id: settings.conversationId || undefined
-    }
-  }
+function normalizeChatResponse(raw) {
   return {
-    message,
-    user_id: settings.userId || 'anonymous',
-    conversation_id: settings.conversationId || undefined
-  }
-}
-
-function normalizeChatResponse(type, raw) {
-  return {
-    backend: type,
-    conversationId: raw.conversation_id || raw.conversationId || raw.conv_id || '',
+    conversationId: raw.conv_id || raw.conversation_id || raw.conversationId || '',
     response: raw.response || '',
     intent: raw.intent || 'other',
     agentType: raw.agent_type || raw.agentType || '',
     escalated: Boolean(raw.escalated),
     latencyMs: Number(raw.latency_ms ?? raw.latencyMs ?? 0),
     knowledgeUsed: Boolean(raw.knowledge_used ?? raw.knowledgeUsed),
-    verified: raw.verified,
-    grounded: raw.grounded,
     raw
   }
 }
@@ -137,7 +104,7 @@ function normalizeBaseUrl(value) {
 
 function readSettings() {
   try {
-    return JSON.parse(localStorage.getItem('echomind.frontend.settings') || '{}')
+    return JSON.parse(localStorage.getItem('standardpilot.frontend.settings') || localStorage.getItem('echomind.frontend.settings') || '{}')
   } catch {
     return {}
   }
