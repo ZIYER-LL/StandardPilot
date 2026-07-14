@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+
+**/node_modules/
+EchoMindFrontend/dist/
+EchoMind/data/
+EchoMind/logs/
+
+*.log
+.DS_Store
+Thumbs.db
