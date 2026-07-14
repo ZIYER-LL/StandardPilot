@@ -1,0 +1,27 @@
+name: standardpilot
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  frontend:
+    build:
+      context: ./EchoMindFrontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api/python
+    image: standardpilot-frontend:local
+    container_name: standardpilot-frontend
+    ports:
+      - "${APP_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - standardpilot-network
+    healthcheck:
+      test:
