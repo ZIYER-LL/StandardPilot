@@ -30,7 +30,7 @@ docker compose up -d --build
 也可以使用：
 
 ```bash
-./docker-deploy.sh up
+bash docker-deploy.sh up
 ```
 
 ## 访问地址
