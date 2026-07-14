@@ -1,26 +1,21 @@
-# Prometheus 配置文件 — StandardPilot 标准文稿处理系统
-
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
   external_labels:
-    cluster: 'standardpilot'
-    environment: 'production'
-
-rule_files:
-  - "alerts/*.yml"
+    cluster: standardpilot
+    environment: docker-compose
 
 scrape_configs:
-  # StandardPilot 主应用指标
-  - job_name: 'standardpilot-app'
-    static_configs:
-      - targets: ['echomind:8000']
-        labels:
-          service: 'standardpilot'
+  - job_name: standardpilot-backend
+    metrics_path: /metrics
     scrape_interval: 10s
-    metrics_path: '/metrics'
-
-  # Prometheus 自监控
-  - job_name: 'prometheus'
     static_configs:
-      - targets: ['localhost:9090']
+      - targets:
+          - backend:8000
+        labels:
+          service: standardpilot-backend
+
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090
