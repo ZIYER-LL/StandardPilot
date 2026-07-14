@@ -11,13 +11,33 @@ Browser
 frontend (Nginx + Vue)
   ├─ /                  -> Vue SPA
   └─ /api/python/*      -> backend:8000
-                              ├─ redis:6379
-                              └─ chromadb:8000
+                               ├─ redis:6379
+                               └─ chromadb:8000
 
 prometheus -> backend:8000/metrics
 ```
 
 容器通过 `standardpilot-network` 使用服务名通信，不再依赖 `host.docker.internal`，也不需要分别进入前后端目录启动两套 Compose。
+
+## GitHub Codespaces
+
+仓库内置 `.devcontainer` 配置，可直接从 GitHub 创建统一的云端开发环境，不占用本地磁盘。
+
+1. 在仓库页面点击 **Code → Codespaces → Create codespace on main**。
+2. 创建前在 Codespaces secrets 中配置 `ANTHROPIC_API_KEY`。
+3. Codespace 初始化完成后运行：
+
+```bash
+docker compose up -d --build
+```
+
+默认转发端口：
+
+- `8080`：StandardPilot 工作台
+- `8000`：FastAPI Swagger
+- `9090`：Prometheus
+
+`.devcontainer/post-create.sh` 会自动创建被 Git 忽略的 `.env`、注入 Codespaces Secret，并执行 `docker compose config` 校验，但不会自动启动完整服务，避免每次重建环境都消耗构建资源。
 
 ## 快速启动
 
@@ -66,6 +86,7 @@ docker compose down -v
 
 ## 目录
 
+- `.devcontainer/`：GitHub Codespaces 开发环境配置
 - `EchoMind/`：FastAPI、Agent、Memory、RAG、Skills、评测与监控
 - `EchoMindFrontend/`：Vue 3 标准研究工作台
 - `docker-compose.yml`：完整服务编排的唯一入口
