@@ -61,7 +61,7 @@ case "${1:-help}" in
     ;;
   *)
     cat <<'EOF'
-Usage: ./docker-deploy.sh <command>
+Usage: bash docker-deploy.sh <command>
 
 Commands:
   up        Build and start the complete stack
