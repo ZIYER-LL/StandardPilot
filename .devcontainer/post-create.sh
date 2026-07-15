@@ -15,24 +15,41 @@ from pathlib import Path
 
 path = Path('.env')
 text = path.read_text(encoding='utf-8')
-api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+lines = text.splitlines()
 
-if not api_key:
-    print('[WARN] ANTHROPIC_API_KEY is not configured as a Codespaces secret.')
+zhipu_key = os.environ.get('ZHIPU_API_KEY', '').strip()
+anthropic_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+
+updates = {}
+if zhipu_key:
+    updates.update({
+        'LLM_PROVIDER': 'zhipu',
+        'ZHIPU_API_KEY': zhipu_key,
+    })
+    print('[OK] Applied ZHIPU_API_KEY to the ignored .env file.')
+elif anthropic_key:
+    updates.update({
+        'LLM_PROVIDER': 'anthropic',
+        'ANTHROPIC_API_KEY': anthropic_key,
+    })
+    print('[OK] Applied ANTHROPIC_API_KEY to the ignored .env file.')
 else:
-    lines = text.splitlines()
+    print('[WARN] Neither ZHIPU_API_KEY nor ANTHROPIC_API_KEY is configured as a Codespaces secret.')
+
+if updates:
     output = []
-    replaced = False
+    seen = set()
     for line in lines:
-        if line.startswith('ANTHROPIC_API_KEY='):
-            output.append(f'ANTHROPIC_API_KEY={api_key}')
-            replaced = True
+        key = line.split('=', 1)[0] if '=' in line and not line.lstrip().startswith('#') else None
+        if key in updates:
+            output.append(f'{key}={updates[key]}')
+            seen.add(key)
         else:
             output.append(line)
-    if not replaced:
-        output.append(f'ANTHROPIC_API_KEY={api_key}')
+    for key, value in updates.items():
+        if key not in seen:
+            output.append(f'{key}={value}')
     path.write_text('\n'.join(output) + '\n', encoding='utf-8')
-    print('[OK] Applied the Codespaces secret to the ignored .env file.')
 PY
 
 docker compose version
