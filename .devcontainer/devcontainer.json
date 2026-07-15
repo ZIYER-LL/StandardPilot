@@ -39,8 +39,11 @@
     }
   },
   "secrets": {
+    "ZHIPU_API_KEY": {
+      "description": "Zhipu GLM API key used by the StandardPilot backend"
+    },
     "ANTHROPIC_API_KEY": {
-      "description": "API key used by the StandardPilot backend"
+      "description": "Optional Anthropic API key used when LLM_PROVIDER=anthropic"
     }
   },
   "postCreateCommand": "bash .devcontainer/post-create.sh",
