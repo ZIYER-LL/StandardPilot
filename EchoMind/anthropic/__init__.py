@@ -1,7 +1,7 @@
 """Small Anthropic-compatible async client for StandardPilot.
 
 StandardPilot historically calls ``AsyncAnthropic.messages.create`` from its
-agents, intent recognizer, memory manager, RAG reranker, and evaluator.  This
+agents, intent recognizer, memory manager, RAG reranker, and evaluator. This
 module keeps that internal interface stable while routing requests to either
 Anthropic Messages API or an OpenAI-compatible provider such as Zhipu GLM.
 """
@@ -105,29 +105,79 @@ class AsyncAnthropic:
             request_messages.append({"role": "system", "content": system})
         request_messages.extend(messages)
 
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": request_messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False,
+        }
+
+        # GLM-4.7 defaults to thinking mode. Short internal tasks such as intent
+        # recognition, query rewriting and reranking can consume the entire
+        # output budget in reasoning_content and leave message.content empty.
+        # Disable thinking by default for this application. It can be enabled
+        # explicitly with ZHIPU_THINKING_ENABLED=true.
+        thinking_enabled = os.getenv("ZHIPU_THINKING_ENABLED", "false").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
+
         response = await self._http.post(
             f"{base_url}/chat/completions",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": model,
-                "messages": request_messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "stream": False,
-            },
+            json=payload,
         )
         response.raise_for_status()
-        payload = response.json()
+        data = response.json()
+        content = self._extract_openai_content(data)
+
+        # Defensive retry: some compatible endpoints may still return only
+        # reasoning_content. Retry once with thinking explicitly disabled.
+        if not content and thinking_enabled:
+            payload["thinking"] = {"type": "disabled"}
+            retry = await self._http.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            retry.raise_for_status()
+            data = retry.json()
+            content = self._extract_openai_content(data)
+
+        if not content:
+            choices = data.get("choices") or []
+            message = choices[0].get("message", {}) if choices else {}
+            finish_reason = choices[0].get("finish_reason") if choices else None
+            reasoning = message.get("reasoning_content") or ""
+            raise RuntimeError(
+                "LLM returned empty content "
+                f"(finish_reason={finish_reason!r}, reasoning_chars={len(str(reasoning))})"
+            )
+        return content
+
+    @staticmethod
+    def _extract_openai_content(payload: Dict[str, Any]) -> str:
         choices = payload.get("choices") or []
         if not choices:
-            raise RuntimeError(f"LLM returned no choices: {payload}")
-        content = choices[0].get("message", {}).get("content")
-        if not content:
-            raise RuntimeError("LLM returned empty content")
-        return str(content)
+            return ""
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("text"):
+                    parts.append(str(item["text"]))
+            return "\n".join(parts).strip()
+        return ""
 
     async def _create_anthropic(
         self,
