@@ -51,6 +51,83 @@ export async function requestChat(settings, message) {
   return normalizeChatResponse(raw)
 }
 
+export async function streamChat(settings, message, handlers = {}, signal) {
+  const baseUrl = backendMeta(settings).baseUrl
+  const response = await fetch(`${baseUrl}/chat/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+    body: JSON.stringify({
+      message,
+      user_id: settings.userId || 'anonymous',
+      conv_id: settings.conversationId || undefined
+    }),
+    signal
+  })
+  if (!response.ok) {
+    const detail = await response.text()
+    throw new Error(`${response.status} ${response.statusText}: ${detail}`)
+  }
+  if (!response.body) throw new Error('浏览器未提供流式响应体')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let doneEvent = null
+
+  const dispatch = (event) => {
+    handlers.onEvent?.(event)
+    const key = `on${event.type.split('_').map((part) => part[0].toUpperCase() + part.slice(1)).join('')}`
+    handlers[key]?.(event)
+    if (event.type === 'done') doneEvent = event
+    if (event.type === 'error') throw new Error(event.message || '流式请求失败')
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+    for (const line of lines) {
+      const text = line.trim()
+      if (!text) continue
+      dispatch(JSON.parse(text))
+    }
+    if (done) break
+  }
+  if (buffer.trim()) dispatch(JSON.parse(buffer.trim()))
+  return doneEvent
+}
+
+export async function listConversations(settings, limit = 50) {
+  const params = new URLSearchParams({ user_id: settings.userId || 'anonymous', limit: String(limit) })
+  return requestJson(backendMeta(settings).baseUrl, `/conversations?${params}`)
+}
+
+export async function getConversation(settings, conversationId) {
+  const params = new URLSearchParams({ user_id: settings.userId || 'anonymous' })
+  return requestJson(backendMeta(settings).baseUrl, `/conversations/${encodeURIComponent(conversationId)}?${params}`)
+}
+
+export async function deleteConversation(settings, conversationId) {
+  const params = new URLSearchParams({ user_id: settings.userId || 'anonymous' })
+  return requestJson(backendMeta(settings).baseUrl, `/conversations/${encodeURIComponent(conversationId)}?${params}`, { method: 'DELETE' })
+}
+
+export async function listTraces(settings, { limit = 50, conversationId = '' } = {}) {
+  const params = new URLSearchParams({ limit: String(limit), user_id: settings.userId || 'anonymous' })
+  if (conversationId) params.set('conv_id', conversationId)
+  return requestJson(backendMeta(settings).baseUrl, `/traces?${params}`)
+}
+
+export async function getTrace(settings, traceId) {
+  return requestJson(backendMeta(settings).baseUrl, `/traces/${encodeURIComponent(traceId)}`)
+}
+
+export async function requestObservabilitySummary(settings, limit = 100) {
+  const params = new URLSearchParams({ limit: String(limit) })
+  return requestJson(backendMeta(settings).baseUrl, `/observability/summary?${params}`)
+}
+
 export async function addKnowledge(settings, documents) {
   return requestJson(backendMeta(settings).baseUrl, '/knowledge/add', {
     method: 'POST',
