@@ -44,7 +44,7 @@ class AdaptiveRouter:
         if tdoc:
             return RouteDecision(ExecutionMode.SPECIALIST_AGENT, "tdoc_summary", 0.88, ResponseProfile.DETAILED if detailed else ResponseProfile.STANDARD, specialist="tdoc_analyst", retrieval_required=True, reason_codes=["document_analysis_task"], source="heuristic")
         if any(key in text for key in ("3gpp", "标准", "nwdaf", "5gc", "amf", "smf", "pcf", "qos", "release", "agenda")):
-            return RouteDecision(ExecutionMode.RAG_GENERATION, "standard_qa", 0.84, ResponseProfile.DETAILED if detailed else ResponseProfile.STANDARD, retrieval_required=True, reason_codes=["domain_knowledge_required"], source="heuristic")
+            return RouteDecision(ExecutionMode.RAG_GENERATION, "standard_qa", 0.88, ResponseProfile.DETAILED if detailed else ResponseProfile.STANDARD, retrieval_required=True, reason_codes=["clear_domain_question", "domain_knowledge_required"], source="heuristic")
         return RouteDecision(ExecutionMode.DIRECT_GENERATION, "general_chat", 0.72, ResponseProfile.DETAILED if detailed else ResponseProfile.BRIEF, reason_codes=["no_external_evidence_required"], source="heuristic")
 
     async def _model_decision(self, message: str, history: Optional[List[Dict[str, str]]], fallback: RouteDecision) -> RouteDecision:
