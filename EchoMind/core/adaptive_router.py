@@ -48,16 +48,10 @@ class AdaptiveRouter:
         return RouteDecision(ExecutionMode.DIRECT_GENERATION, "general_chat", 0.72, ResponseProfile.DETAILED if detailed else ResponseProfile.BRIEF, reason_codes=["no_external_evidence_required"], source="heuristic")
 
     async def _model_decision(self, message: str, history: Optional[List[Dict[str, str]]], fallback: RouteDecision) -> RouteDecision:
-        prompt = {
-            "message": message,
-            "recent_history": history[-3:] if history else [],
-            "allowed_modes": [item.value for item in ExecutionMode],
-            "allowed_profiles": [item.value for item in ResponseProfile],
-            "fallback": fallback.to_dict(),
-        }
+        prompt = {"message": message, "recent_history": history[-3:] if history else [], "allowed_modes": [item.value for item in ExecutionMode], "allowed_profiles": [item.value for item in ResponseProfile], "fallback": fallback.to_dict()}
         system = "你是受约束的任务路由器。只输出JSON，不回答用户问题。选择最短且足够的执行模式；复杂多任务才用manager_agent。"
         with stage("adaptive_router"):
-            raw = await self.gateway.complete(messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}], system=system, max_tokens=280, temperature=0.0)
+            raw = await self.gateway.complete(messages=[{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}], system=system, max_tokens=280, temperature=0.0, role="router")
         start, end = raw.find("{"), raw.rfind("}") + 1
         data: Dict[str, Any] = json.loads(raw[start:end])
         return RouteDecision(
