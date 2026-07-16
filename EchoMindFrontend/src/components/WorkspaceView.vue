@@ -11,10 +11,10 @@
     </aside>
 
     <main class="chat-workspace">
-      <div class="section-heading chat-title"><div><span class="eyebrow">RESEARCH COPILOT</span><h2>{{ currentTitle }}</h2></div><span class="stream-indicator"><i :class="traceStatus"></i>{{ traceStatus === 'running' ? '实时生成' : '就绪' }}</span></div>
+      <div class="section-heading chat-title"><div><span class="eyebrow">ADAPTIVE RESEARCH COPILOT</span><h2>{{ currentTitle }}</h2></div><span class="stream-indicator"><i :class="traceStatus"></i>{{ traceStatus === 'running' ? '自适应执行中' : '就绪' }}</span></div>
       <div class="message-list" ref="messageList">
         <div v-if="messages.length === 0" class="empty-state">
-          <span>SP</span><h3>从一个标准研究问题开始</h3><p>系统会同步展示 RAG、意图识别、Agent 路由、首 Token 和完整执行轨迹。</p>
+          <span>SP</span><h3>从一个标准研究问题开始</h3><p>系统会自主选择零模型工具、RAG、专业 Agent 或 Manager 模式，并展示决策原因。</p>
           <div class="prompt-grid"><button v-for="prompt in prompts" :key="prompt" @click="draft = prompt">{{ prompt }}</button></div>
         </div>
         <article v-for="message in messages" :key="message.id" :class="['message-card', message.role]">
@@ -24,7 +24,7 @@
       </div>
       <form class="composer" @submit.prevent="send">
         <textarea v-model="draft" rows="4" placeholder="输入标准研究问题，Ctrl + Enter 发送" @keydown.ctrl.enter.prevent="send"></textarea>
-        <div><span>回答将保留证据、Agent 链路与精确模型用量</span><button v-if="busy" type="button" class="danger" @click="stop">停止</button><button v-else class="primary" :disabled="!draft.trim()">发送分析</button></div>
+        <div><span>回答将保留路由决策、检索深度、模型降级与精确用量</span><button v-if="busy" type="button" class="danger" @click="stop">停止</button><button v-else class="primary" :disabled="!draft.trim()">发送分析</button></div>
       </form>
     </main>
 
@@ -35,7 +35,8 @@
 <script setup>
 import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import TracePanel from './TracePanel.vue'
-import { getConversation, listConversations, streamChat } from '../lib/backends'
+import { getConversation, listConversations } from '../lib/backends'
+import { streamAdaptiveChat } from '../lib/adaptive'
 
 const props = defineProps({ settings: { type: Object, required: true } })
 const emit = defineEmits(['conversation-change'])
@@ -53,7 +54,7 @@ const traceStatus = ref('idle')
 let controller = null
 let pendingText = ''
 let paintFrame = 0
-const prompts = ['NWDAF 在现有 5GC 中可以为 AI 推理服务提供哪些分析能力？', 'UE 移动时执行位置重选是标准问题还是实现问题？', '请分析该议题是否存在标准化 Gap，并区分证据、推断和待确认内容。']
+const prompts = ['知识库目前有多少个文档片段？', 'NWDAF 在现有 5GC 中可以为 AI 推理服务提供哪些分析能力？', '总结相关文稿、判断标准化 Gap，并给出提案建议。']
 const currentConversationId = computed(() => props.settings.conversationId || '')
 const currentTitle = computed(() => conversations.value.find((item) => item.conv_id === currentConversationId.value)?.title || '标准文稿分析工作台')
 
@@ -68,28 +69,20 @@ async function openConversation(convId) {
   messages.value = (data.messages || []).map((item) => reactive({ id: crypto.randomUUID(), role: item.role, content: item.content, meta: item.meta ? [item.meta.intent, item.meta.agent_type, formatMs(item.meta.ttft_ms), formatMs(item.meta.e2e_latency_ms)].filter(Boolean).join(' · ') : '' }))
   const latest = data.traces?.[data.traces.length - 1]
   if (latest) applyStoredTrace(latest)
-  await scrollBottom(false)
+  await scrollBottom()
 }
 
 function scheduleTokenPaint(assistant) {
   if (paintFrame) return
   paintFrame = requestAnimationFrame(async () => {
     paintFrame = 0
-    if (pendingText) {
-      assistant.content += pendingText
-      pendingText = ''
-      await scrollBottom(false)
-    }
+    if (pendingText) { assistant.content += pendingText; pendingText = ''; await scrollBottom() }
   })
 }
-
 function flushTokens(assistant) {
   if (paintFrame) cancelAnimationFrame(paintFrame)
   paintFrame = 0
-  if (pendingText) {
-    assistant.content += pendingText
-    pendingText = ''
-  }
+  if (pendingText) { assistant.content += pendingText; pendingText = '' }
 }
 
 async function send() {
@@ -100,20 +93,23 @@ async function send() {
   const assistant = reactive({ id: crypto.randomUUID(), role: 'assistant', content: '', meta: '', streaming: true })
   messages.value.push(assistant)
   controller = new AbortController()
-  await scrollBottom(false)
+  await scrollBottom()
   try {
-    await streamChat(props.settings, content, { onEvent(event) {
+    await streamAdaptiveChat(props.settings, content, { onEvent(event) {
       if (event.type === 'meta') { if (!currentConversationId.value) emit('conversation-change', event.conv_id) }
       else if (event.type === 'delta') { pendingText += event.content || ''; scheduleTokenPaint(assistant) }
-      else if (event.type === 'stage') { upsertTraceEvent(event); if (event.evidence) evidence.value = event.evidence }
-      else if (['agent', 'fallback', 'first_token'].includes(event.type)) { upsertTraceEvent(event); if (event.type === 'first_token') traceMetrics.value = { ...traceMetrics.value, ttftMs: event.ttft_ms } }
-      else if (event.type === 'route') { route.value = { intent: event.intent, selectedAgent: event.selected_agent, plannedAgents: event.planned_agents }; upsertTraceEvent({ ...event, type: 'stage', stage: 'agent.route', status: 'completed' }) }
+      else if (event.type === 'first_token') { traceMetrics.value = { ...traceMetrics.value, ttftMs: event.ttft_ms }; upsertTraceEvent({ ...event, status: 'completed' }) }
+      else if (event.type === 'decision') {
+        upsertTraceEvent({ ...event, type: 'stage', stage: event.node, status: 'completed' })
+        if (event.node === 'adaptive_router') route.value = { intent: event.task_type, selectedAgent: event.mode, plannedAgents: event.specialist ? [event.specialist] : [], reasonCodes: event.reason_codes, profile: event.response_profile }
+        if (event.node === 'fast_gate' && event.matched) route.value = { intent: 'deterministic', selectedAgent: `direct:${event.action}`, plannedAgents: [], reasonCodes: [event.reason_code], profile: 'brief' }
+      }
+      else if (event.type === 'retrieval') { evidence.value = event.evidence || []; upsertTraceEvent({ ...event, type: 'stage', stage: `retrieval.${event.decision}`, status: 'completed' }) }
       else if (event.type === 'done') {
-        flushTokens(assistant)
-        traceStatus.value = 'ok'
-        llmCalls.value = event.llm_calls || []
-        traceMetrics.value = { ttftMs: event.ttft_ms, e2eMs: event.e2e_latency_ms, generationMs: event.generation_ms, llmCalls: event.llm_call_count, inputTokens: event.input_tokens, outputTokens: event.output_tokens, totalTokens: event.total_tokens, fallbacks: event.fallback_count }
-        assistant.meta = [event.intent, event.agent_type, event.knowledge_used ? 'RAG' : '', `TTFT ${formatMs(event.ttft_ms)}`, `E2E ${formatMs(event.e2e_latency_ms)}`, `${event.llm_call_count || 0} 次模型调用`].filter(Boolean).join(' · ')
+        flushTokens(assistant); traceStatus.value = 'ok'; llmCalls.value = event.llm_calls || []
+        traceMetrics.value = { ttftMs: event.ttft_ms, e2eMs: event.e2e_latency_ms, llmCalls: event.llm_call_count, inputTokens: event.input_tokens, outputTokens: event.output_tokens, totalTokens: event.total_tokens, fallbacks: event.fallback_count || 0 }
+        const decision = event.route_decision
+        assistant.meta = [decision?.mode || (event.fast_gate?.matched ? `direct:${event.fast_gate.action}` : ''), decision?.response_profile, `TTFT ${formatMs(event.ttft_ms)}`, `E2E ${formatMs(event.e2e_latency_ms)}`, `${event.llm_call_count || 0} 次模型调用`].filter(Boolean).join(' · ')
       }
     } }, controller.signal)
   } catch (error) {
@@ -121,14 +117,14 @@ async function send() {
     if (error.name !== 'AbortError') { assistant.content ||= error.message; assistant.meta = '请求失败'; traceStatus.value = 'error' }
     else { assistant.meta = '已停止'; traceStatus.value = 'idle' }
   } finally {
-    flushTokens(assistant); assistant.streaming = false; busy.value = false; controller = null; await refreshConversations(); await scrollBottom(false)
+    flushTokens(assistant); assistant.streaming = false; busy.value = false; controller = null; await refreshConversations(); await scrollBottom()
   }
 }
 
 function stop() { controller?.abort() }
 function resetTrace() { traceEvents.value = []; traceMetrics.value = {}; route.value = {}; evidence.value = []; llmCalls.value = []; traceStatus.value = 'idle'; pendingText = ''; if (paintFrame) cancelAnimationFrame(paintFrame); paintFrame = 0 }
-function upsertTraceEvent(event) { const key = event.span_id || `${event.type}-${event.stage || event.agent || traceEvents.value.length}`; const index = traceEvents.value.findIndex((item) => item.key === key); const value = { ...event, key }; if (index >= 0) traceEvents.value.splice(index, 1, value); else traceEvents.value.push(value) }
-function applyStoredTrace(trace) { traceStatus.value = trace.status === 'ok' ? 'ok' : trace.status; traceEvents.value = (trace.spans || []).map((span) => ({ ...span, type: 'stage', stage: span.name, key: span.span_id })); traceMetrics.value = { ttftMs: trace.ttft_ms, e2eMs: trace.e2e_latency_ms, generationMs: trace.generation_ms, llmCalls: trace.llm_call_count, inputTokens: trace.input_tokens, outputTokens: trace.output_tokens, totalTokens: trace.total_tokens, fallbacks: trace.fallback_count }; llmCalls.value = trace.llm_calls || []; route.value = { intent: trace.intent, selectedAgent: trace.selected_agent, plannedAgents: trace.planned_agents }; evidence.value = trace.evidence || [] }
-async function scrollBottom(smooth = false) { await nextTick(); messageList.value?.scrollTo({ top: messageList.value.scrollHeight, behavior: smooth ? 'smooth' : 'auto' }) }
+function upsertTraceEvent(event) { const key = event.span_id || `${event.stage || event.type}-${traceEvents.value.length}`; traceEvents.value.push({ ...event, key }) }
+function applyStoredTrace(trace) { traceStatus.value = trace.status === 'ok' ? 'ok' : trace.status; traceEvents.value = [...(trace.decisions || []), ...(trace.spans || [])].map((item, index) => ({ ...item, type: 'stage', stage: item.node || item.name || item.type, key: item.span_id || `stored-${index}` })); traceMetrics.value = { ttftMs: trace.ttft_ms, e2eMs: trace.e2e_latency_ms, llmCalls: trace.llm_call_count, inputTokens: trace.input_tokens, outputTokens: trace.output_tokens, totalTokens: trace.total_tokens, fallbacks: trace.fallback_count }; llmCalls.value = trace.llm_calls || []; const decision = trace.route_decision || {}; route.value = { intent: decision.task_type, selectedAgent: decision.mode || trace.selected_agent, plannedAgents: decision.specialist ? [decision.specialist] : [], reasonCodes: decision.reason_codes, profile: decision.response_profile }; evidence.value = trace.evidence || [] }
+async function scrollBottom() { await nextTick(); messageList.value?.scrollTo({ top: messageList.value.scrollHeight, behavior: 'auto' }) }
 function formatMs(value) { return value === null || value === undefined ? '' : `${Math.round(value)} ms` }
 </script>
