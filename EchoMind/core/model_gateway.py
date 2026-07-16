@@ -1,4 +1,4 @@
-"""Multi-provider model gateway with bounded concurrency, retry and fallback."""
+"""Multi-provider model gateway with role pools, bounded concurrency and fallback."""
 from __future__ import annotations
 
 import asyncio
@@ -13,10 +13,13 @@ import httpx
 
 from core.llm_telemetry import record_call
 
+_OPENAI_COMPAT = {"zhipu", "glm", "bigmodel", "openai", "openai_compatible", "deepseek", "qwen", "dashscope"}
+
 
 @dataclass(frozen=True)
 class ProviderSpec:
     name: str
+    provider: str
     api_key: str
     base_url: str
     model: str
@@ -25,48 +28,56 @@ class ProviderSpec:
 
 class ModelGateway:
     def __init__(self) -> None:
-        self.primary = self._spec("PRIMARY", fallback_to_legacy=True)
-        self.fallback = self._spec("FALLBACK", fallback_to_legacy=False)
+        self.primary = self._spec("PRIMARY", legacy=True)
+        self.fallback = self._spec("FALLBACK", legacy=False)
+        self.router = self._spec("ROUTER", legacy=False)
         self._limits: Dict[str, asyncio.Semaphore] = {}
-        for spec in (self.primary, self.fallback):
-            if spec:
+        for spec in (self.primary, self.fallback, self.router):
+            if spec and spec.name not in self._limits:
                 self._limits[spec.name] = asyncio.Semaphore(max(1, spec.max_concurrency))
 
-    def _spec(self, prefix: str, fallback_to_legacy: bool) -> Optional[ProviderSpec]:
+    def _spec(self, prefix: str, legacy: bool) -> Optional[ProviderSpec]:
         provider = os.getenv(f"{prefix}_LLM_PROVIDER", "").strip().lower()
-        if not provider and fallback_to_legacy:
+        if not provider and legacy:
             provider = os.getenv("LLM_PROVIDER", "zhipu").strip().lower()
         if not provider:
             return None
         legacy_key = os.getenv("ZHIPU_API_KEY") or os.getenv("ANTHROPIC_API_KEY", "")
-        key = os.getenv(f"{prefix}_LLM_API_KEY", legacy_key if fallback_to_legacy else "")
+        key = os.getenv(f"{prefix}_LLM_API_KEY", legacy_key if legacy else "")
         if not key:
             return None
-        if provider in {"zhipu", "glm", "bigmodel", "openai_compatible"}:
+        if provider in _OPENAI_COMPAT:
             default_base = os.getenv("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
             default_model = os.getenv("ZHIPU_MODEL", "glm-4.7-flash")
         else:
             default_base = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
             default_model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
         return ProviderSpec(
-            name=f"{prefix.lower()}:{provider}",
+            name=f"{prefix.lower()}:{provider}:{os.getenv(f'{prefix}_LLM_MODEL', default_model)}",
+            provider=provider,
             api_key=key,
             base_url=os.getenv(f"{prefix}_LLM_BASE_URL", default_base).rstrip("/"),
             model=os.getenv(f"{prefix}_LLM_MODEL", default_model),
-            max_concurrency=int(os.getenv(f"{prefix}_LLM_MAX_CONCURRENCY", "2" if prefix == "PRIMARY" else "1")),
+            max_concurrency=int(os.getenv(f"{prefix}_LLM_MAX_CONCURRENCY", "1" if prefix == "ROUTER" else "2")),
         )
 
-    async def complete(self, *, messages: List[Dict[str, Any]], system: str = "", max_tokens: int = 512, temperature: float = 0.0) -> str:
+    def _chain(self, role: str) -> List[ProviderSpec]:
+        ordered = (self.router, self.primary, self.fallback) if role == "router" else (self.primary, self.fallback)
+        result: List[ProviderSpec] = []
+        for spec in ordered:
+            if spec and spec.name not in {item.name for item in result}:
+                result.append(spec)
+        return result
+
+    async def complete(self, *, messages: List[Dict[str, Any]], system: str = "", max_tokens: int = 512, temperature: float = 0.0, role: str = "generation") -> str:
         parts: List[str] = []
-        async for token in self.stream(messages=messages, system=system, max_tokens=max_tokens, temperature=temperature):
+        async for token in self.stream(messages=messages, system=system, max_tokens=max_tokens, temperature=temperature, role=role):
             parts.append(token)
         return "".join(parts)
 
-    async def stream(self, *, messages: List[Dict[str, Any]], system: str = "", max_tokens: int = 1024, temperature: float = 0.2) -> AsyncIterator[str]:
+    async def stream(self, *, messages: List[Dict[str, Any]], system: str = "", max_tokens: int = 1024, temperature: float = 0.2, role: str = "generation") -> AsyncIterator[str]:
         errors: List[str] = []
-        for spec in (self.primary, self.fallback):
-            if not spec:
-                continue
+        for spec in self._chain(role):
             for attempt in range(2):
                 try:
                     async with self._limits[spec.name]:
@@ -85,11 +96,12 @@ class ModelGateway:
         raise RuntimeError("所有模型供应商均不可用: " + ", ".join(errors))
 
     async def _stream_once(self, spec: ProviderSpec, messages: List[Dict[str, Any]], system: str, max_tokens: int, temperature: float) -> AsyncIterator[str]:
-        provider = spec.name.split(":", 1)[1]
         started = time.time()
-        if provider in {"zhipu", "glm", "bigmodel", "openai_compatible"}:
+        if spec.provider in _OPENAI_COMPAT:
             request_messages = ([{"role": "system", "content": system}] if system else []) + messages
-            body = {"model": spec.model, "messages": request_messages, "max_tokens": max_tokens, "temperature": temperature, "stream": True, "stream_options": {"include_usage": True}, "thinking": {"type": "disabled"}}
+            body = {"model": spec.model, "messages": request_messages, "max_tokens": max_tokens, "temperature": temperature, "stream": True, "stream_options": {"include_usage": True}}
+            if spec.provider in {"zhipu", "glm", "bigmodel"}:
+                body["thinking"] = {"type": "disabled"}
             url = f"{spec.base_url}/chat/completions"
             headers = {"Authorization": f"Bearer {spec.api_key}", "Content-Type": "application/json"}
         else:
@@ -101,8 +113,7 @@ class ModelGateway:
         response_id = request_id = None
         usage: Dict[str, Any] = {}
         try:
-            timeout = httpx.Timeout(180.0, connect=20.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=20.0)) as client:
                 async with client.stream("POST", url, headers=headers, json=body) as response:
                     response.raise_for_status()
                     request_id = response.headers.get("x-request-id") or response.headers.get("request-id")
@@ -115,9 +126,9 @@ class ModelGateway:
                         event = json.loads(raw)
                         response_id = response_id or event.get("id")
                         usage = event.get("usage") or usage
-                        if provider in {"zhipu", "glm", "bigmodel", "openai_compatible"}:
+                        if spec.provider in _OPENAI_COMPAT:
                             choices = event.get("choices") or []
-                            text = ((choices[0].get("delta") or {}).get("content") if choices else None)
+                            text = (choices[0].get("delta") or {}).get("content") if choices else None
                         else:
                             delta = event.get("delta") or {}
                             text = delta.get("text") if event.get("type") == "content_block_delta" else None
@@ -129,7 +140,7 @@ class ModelGateway:
                             yield text
             input_tokens = usage.get("prompt_tokens") or usage.get("input_tokens")
             output_tokens = usage.get("completion_tokens") or usage.get("output_tokens")
-            record_call(provider=provider, model=spec.model, started_at_epoch=started, status="ok", provider_response_id=response_id, provider_request_id=request_id, input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=usage.get("total_tokens"), streaming=True)
+            record_call(provider=spec.provider, model=spec.model, started_at_epoch=started, status="ok", provider_response_id=response_id, provider_request_id=request_id, input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=usage.get("total_tokens"), streaming=True)
         except Exception as exc:
-            record_call(provider=provider, model=spec.model, started_at_epoch=started, status="error", error=str(exc), streaming=True)
+            record_call(provider=spec.provider, model=spec.model, started_at_epoch=started, status="error", error=str(exc), streaming=True)
             raise
