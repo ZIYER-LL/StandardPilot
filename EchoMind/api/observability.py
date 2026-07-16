@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 import api.main as main_api
 from core.llm_stream import stream_text
+from core.llm_telemetry import begin_capture, finish_capture, stage, summarize
 from core.trace_store import TraceStore
 
 router = APIRouter(tags=["Observability"])
@@ -69,7 +70,7 @@ def _span_end(span: Dict[str, Any], status: str = "ok", error: Optional[str] = N
         span["error"] = error
 
 
-async def _knowledge_context(message: str, trace: Dict[str, Any]) -> tuple[str, bool, List[Dict[str, Any]]]:
+async def _knowledge_context(message: str) -> tuple[str, bool, List[Dict[str, Any]]]:
     if main_api._tool_manager is None or not main_api._should_use_knowledge(message):
         return "", False, []
     result = await main_api._tool_manager.search_with_rewrite("knowledge_search", message, top_k=3)
@@ -127,6 +128,8 @@ async def chat_stream(body: StreamChatRequest, request: HttpRequest):
         from agents.agent_orchestrator import AgentType, Request as OrcRequest
         from memory.conversation_memory import MsgRole
 
+        capture_token = begin_capture()
+        capture_finished = False
         started = time.time()
         trace_id = uuid.uuid4().hex
         conv_id = body.conv_id or str(uuid.uuid4())
@@ -141,12 +144,12 @@ async def chat_stream(body: StreamChatRequest, request: HttpRequest):
             "spans": [],
             "executed_agents": [],
             "fallback_count": 0,
-            "llm_call_count_estimate": 0,
+            "llm_calls": [],
         }
         response_parts: List[str] = []
         first_token_at: Optional[float] = None
         generation_started_at: Optional[float] = None
-        selected_agent = None
+        selected_agent: Optional[str] = None
         intent_value = "other"
         knowledge_used = False
         evidence: List[Dict[str, Any]] = []
@@ -166,8 +169,8 @@ async def chat_stream(body: StreamChatRequest, request: HttpRequest):
 
             span = _span_start(trace, "rag.retrieve")
             yield _event("stage", span_id=span["span_id"], stage=span["name"], status="running")
-            knowledge_text, knowledge_used, evidence = await _knowledge_context(body.message, trace)
-            trace["llm_call_count_estimate"] += 2 if knowledge_used else 0
+            with stage("rag.retrieve"):
+                knowledge_text, knowledge_used, evidence = await _knowledge_context(body.message)
             _span_end(span, knowledge_used=knowledge_used, retrieved_chunks=len(evidence))
             yield _event(
                 "stage",
@@ -193,8 +196,8 @@ async def chat_stream(body: StreamChatRequest, request: HttpRequest):
 
             span = _span_start(trace, "intent.recognize")
             yield _event("stage", span_id=span["span_id"], stage=span["name"], status="running")
-            intent_result = await main_api._orchestrator._intent_recognizer.recognize(body.message, history=history)
-            trace["llm_call_count_estimate"] += 1
+            with stage("intent.recognize"):
+                intent_result = await main_api._orchestrator._intent_recognizer.recognize(body.message, history=history)
             orc_req.intent = intent_result.intent
             orc_req.urgency = intent_result.urgency
             intent_value = intent_result.intent.value if intent_result.intent else "other"
@@ -217,33 +220,34 @@ async def chat_stream(body: StreamChatRequest, request: HttpRequest):
             _span_end(span, selected_agent=selected_agent, planned_agents=trace["planned_agents"])
             yield _event("route", span_id=span["span_id"], intent=intent_value, selected_agent=selected_agent, planned_agents=trace["planned_agents"], latency_ms=span["latency_ms"])
 
-            async def run_selected(current_agent: Any, current_type: Any) -> AsyncIterator[str]:
+            async def run_selected(current_agent: Any, current_type: Any) -> AsyncIterator[bytes]:
                 nonlocal first_token_at, generation_started_at
                 agent_span = _span_start(trace, "agent.generate", agent=current_type.value, model=current_agent._model)
                 trace["executed_agents"].append(current_type.value)
-                trace["llm_call_count_estimate"] += 1
                 current_agent.stats.total += 1
                 generation_started_at = time.time()
                 yield _event("agent", span_id=agent_span["span_id"], agent=current_type.value, status="running")
                 success = False
+                before_chars = len("".join(response_parts))
                 try:
-                    async for token in _stream_agent(current_agent, orc_req):
-                        if await request.is_disconnected():
-                            raise asyncio.CancelledError()
-                        if first_token_at is None:
-                            first_token_at = time.time()
-                            trace["ttft_ms"] = round((first_token_at - started) * 1000, 1)
-                            yield _event("first_token", ttft_ms=trace["ttft_ms"], agent=current_type.value)
-                        response_parts.append(token)
-                        yield _event("delta", content=token)
-                    success = bool(response_parts)
+                    with stage(f"agent.generate:{current_type.value}"):
+                        async for token in _stream_agent(current_agent, orc_req):
+                            if await request.is_disconnected():
+                                raise asyncio.CancelledError()
+                            if first_token_at is None:
+                                first_token_at = time.time()
+                                trace["ttft_ms"] = round((first_token_at - started) * 1000, 1)
+                                yield _event("first_token", ttft_ms=trace["ttft_ms"], agent=current_type.value)
+                            response_parts.append(token)
+                            yield _event("delta", content=token)
+                    success = len("".join(response_parts)) > before_chars
                     if not success:
                         raise RuntimeError("模型流未返回文本")
                     current_agent.stats.success += 1
                 finally:
                     elapsed = (time.time() - generation_started_at) * 1000
                     current_agent.stats.total_ms += elapsed
-                    _span_end(agent_span, "ok" if success else "error", output_chars=sum(len(item) for item in response_parts))
+                    _span_end(agent_span, "ok" if success else "error", output_chars=len("".join(response_parts)) - before_chars)
                     yield _event("agent", span_id=agent_span["span_id"], agent=current_type.value, status="completed" if success else "failed", latency_ms=agent_span["latency_ms"])
 
             try:
@@ -268,8 +272,10 @@ async def chat_stream(body: StreamChatRequest, request: HttpRequest):
             await main_api._memory.add_message(body.user_id, conv_id, MsgRole.ASSISTANT, response_text)
             _span_end(span, messages_written=2)
             yield _event("stage", span_id=span["span_id"], stage=span["name"], status="completed", latency_ms=span["latency_ms"])
-            asyncio.create_task(main_api._memory.update_profile(body.user_id, conv_id))
 
+            llm_calls = finish_capture(capture_token)
+            capture_finished = True
+            usage = summarize(llm_calls)
             ended = time.time()
             trace.update({
                 "status": "ok",
@@ -277,6 +283,8 @@ async def chat_stream(body: StreamChatRequest, request: HttpRequest):
                 "intent": intent_value,
                 "knowledge_used": knowledge_used,
                 "evidence": evidence,
+                "llm_calls": llm_calls,
+                **usage,
                 "ended_at_epoch": ended,
                 "e2e_latency_ms": round((ended - started) * 1000, 1),
                 "generation_ms": round((ended - (first_token_at or generation_started_at or ended)) * 1000, 1),
@@ -292,6 +300,7 @@ async def chat_stream(body: StreamChatRequest, request: HttpRequest):
                 last_trace_id=trace_id,
             )
             await _trace_store().save_trace(trace)
+            asyncio.create_task(main_api._memory.update_profile(body.user_id, conv_id))
             yield _event(
                 "done",
                 trace_id=trace_id,
@@ -301,18 +310,25 @@ async def chat_stream(body: StreamChatRequest, request: HttpRequest):
                 executed_agents=trace["executed_agents"],
                 knowledge_used=knowledge_used,
                 fallback_count=trace["fallback_count"],
-                llm_call_count_estimate=trace["llm_call_count_estimate"],
+                llm_calls=llm_calls,
+                **usage,
                 ttft_ms=trace.get("ttft_ms"),
                 generation_ms=trace["generation_ms"],
                 e2e_latency_ms=trace["e2e_latency_ms"],
             )
         except asyncio.CancelledError:
+            if not capture_finished:
+                trace["llm_calls"] = finish_capture(capture_token)
+                trace.update(summarize(trace["llm_calls"]))
             trace["status"] = "cancelled"
             trace["ended_at_epoch"] = time.time()
             trace["e2e_latency_ms"] = round((trace["ended_at_epoch"] - started) * 1000, 1)
             await _trace_store().save_trace(trace)
             raise
         except Exception as error:
+            if not capture_finished:
+                trace["llm_calls"] = finish_capture(capture_token)
+                trace.update(summarize(trace["llm_calls"]))
             trace["status"] = "error"
             trace["error"] = str(error)
             trace["ended_at_epoch"] = time.time()
@@ -323,11 +339,7 @@ async def chat_stream(body: StreamChatRequest, request: HttpRequest):
     return StreamingResponse(
         generate(),
         media_type="application/x-ndjson",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
 
 
@@ -368,8 +380,7 @@ async def delete_conversation(conv_id: str, user_id: str = "anonymous"):
 
 @router.get("/traces")
 async def list_traces(limit: int = 50, user_id: Optional[str] = None, conv_id: Optional[str] = None):
-    traces = await _trace_store().list_traces(limit=limit, user_id=user_id, conv_id=conv_id)
-    return {"traces": traces}
+    return {"traces": await _trace_store().list_traces(limit=limit, user_id=user_id, conv_id=conv_id)}
 
 
 @router.get("/traces/{trace_id}")
@@ -393,16 +404,11 @@ async def observability_summary(limit: int = 100):
         "sample_size": len(completed),
         "success_rate": round(success_count / len(completed), 4) if completed else 0.0,
         "fallback_rate": round(fallback_count / len(completed), 4) if completed else 0.0,
-        "ttft_ms": {
-            "avg": round(sum(ttft) / len(ttft), 1) if ttft else 0.0,
-            "p50": _percentile(ttft, 0.50),
-            "p95": _percentile(ttft, 0.95),
-        },
-        "e2e_latency_ms": {
-            "avg": round(sum(e2e) / len(e2e), 1) if e2e else 0.0,
-            "p50": _percentile(e2e, 0.50),
-            "p95": _percentile(e2e, 0.95),
-        },
+        "total_llm_calls": sum(int(trace.get("llm_call_count", 0)) for trace in completed),
+        "total_input_tokens": sum(int(trace.get("input_tokens", 0)) for trace in completed),
+        "total_output_tokens": sum(int(trace.get("output_tokens", 0)) for trace in completed),
+        "ttft_ms": {"avg": round(sum(ttft) / len(ttft), 1) if ttft else 0.0, "p50": _percentile(ttft, 0.50), "p95": _percentile(ttft, 0.95)},
+        "e2e_latency_ms": {"avg": round(sum(e2e) / len(e2e), 1) if e2e else 0.0, "p50": _percentile(e2e, 0.50), "p95": _percentile(e2e, 0.95)},
         "agent_counts": dict(agent_counts),
         "recent_traces": traces[:20],
     }
