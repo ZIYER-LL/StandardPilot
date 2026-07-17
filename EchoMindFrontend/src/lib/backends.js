@@ -176,7 +176,11 @@ async function requestJson(baseUrl, path, options = {}) {
 }
 
 function normalizeBaseUrl(value) {
-  return String(value || '').replace(/\/+$/, '')
+  const raw = String(value || '').trim().replace(/\/+$/, '')
+  if (!raw) return ''
+  if (raw.startsWith('/')) return raw
+  if (/^https?:\/\//i.test(raw)) return raw
+  return `http://${raw}`
 }
 
 function readSettings() {
